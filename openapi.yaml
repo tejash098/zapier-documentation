@@ -1,0 +1,1470 @@
+openapi: 3.1.0
+
+# =============================================================================
+# Projetly Zapier Integration API
+#
+# This document describes every Projetly (and other non-Zapier) API endpoint
+# that the Projetly Zapier integration calls. It is provided to satisfy Zapier
+# publishing requirement 5.2 ("App APIs are documented").
+#
+# Production hosts:
+#   Marketplace API (data, templates, users, tasks, webhooks): https://market.api.projetly.io
+#   Identity / OAuth host:                                      https://instance.api.projetly.io/api
+#
+# NOTE: the marketplace server below is the base the integration concatenates
+# paths onto (e.g. <base>/zapier/company). If production serves these functions
+# under an additional `/api` route prefix (as the test environment did, i.e.
+# .../api/zapier/...), append `/api` to the marketplace server URL below.
+# =============================================================================
+
+info:
+  title: Projetly Zapier Integration API
+  version: 1.0.1
+  description: |
+    REST API surface consumed by the **Projetly** Zapier integration.
+
+    Projetly is an AI-powered platform for onboarding, project management,
+    workflow automation, and digital sales-room collaboration. The Zapier
+    integration calls the endpoints documented here to read and write
+    companies, contacts, projects/deals, tasks, users, and templates, and to
+    manage REST-hook webhook subscriptions.
+
+    ## Authentication overview
+    Every data, template, user, task, and webhook endpoint requires **three**
+    things on each request:
+
+    1. **`Authorization: Bearer <access_token>`** — an OAuth2 access token
+       (JWT). Obtain it via the OAuth2 *authorization code* flow
+       (`/oauth/authorize` then `/oauth/token`) and refresh it via
+       `/auth_refresh/`.
+    2. **HMAC request signature** — two headers proving the request came from
+       the registered integration:
+       - `X-OAuth-Timestamp`: current Unix time in seconds.
+       - `X-OAuth-Signature`: `HMAC-SHA256(key = CLIENT_SECRET,
+         message = "<CLIENT_ID>:<X-OAuth-Timestamp>")`, hex-encoded.
+    3. **`x-functions-key`** — the Azure Functions host key for the endpoint.
+
+    The OAuth endpoints themselves (`/oauth/authorize`, `/oauth/token`,
+    `/auth_refresh/`) do **not** require the headers above; they authenticate
+    with the client credentials carried in the request.
+
+    ## Conventions
+    - Timestamps are ISO-8601 UTC (e.g. `2026-06-05T07:46:23.312Z`).
+    - List endpoints wrap results in a `results` array and may return a
+      `next_cursor` for cursor pagination, or accept `page` / `items_per_page`
+      for offset pagination.
+    - A trailing slash on a path is accepted (`/zapier/company` and
+      `/zapier/company/` are equivalent).
+    - Object schemas use `additionalProperties: true`: the documented
+      properties are the ones the integration relies on; responses may carry
+      additional fields.
+  contact:
+    name: Projetly
+    url: https://projetly.io
+
+servers:
+  - url: https://market.api.projetly.io
+    description: Production marketplace API host (data, templates, users, tasks, webhooks).
+
+tags:
+  - name: Authentication
+    description: OAuth2 authorization-code flow and token refresh.
+  - name: Companies
+    description: Company records.
+  - name: Contacts
+    description: Contact records.
+  - name: Projects & Deals
+    description: Projects and sales deals (same resource, distinguished by project_type/module).
+  - name: Tasks
+    description: Project tasks and task options.
+  - name: Templates
+    description: Pipeline, deal-stage, and project templates.
+  - name: Users
+    description: Organization users.
+  - name: Webhooks
+    description: REST-hook subscription management.
+  - name: Connection
+    description: Connection / health test.
+
+# All operations require the bearer token + HMAC signature + functions key,
+# unless an operation overrides this (the OAuth operations set `security: []`).
+security:
+  - bearerAuth: []
+    oauthTimestamp: []
+    oauthSignature: []
+    functionsKey: []
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Authentication
+  # ---------------------------------------------------------------------------
+  /oauth/authorize:
+    servers:
+      - url: https://instance.api.projetly.io/api
+        description: Production identity/OAuth host.
+    get:
+      tags: [Authentication]
+      summary: Begin the OAuth2 authorization-code flow
+      description: |
+        Redirects the user to Projetly to grant access. The integration builds
+        a signed authorize URL; on approval Projetly redirects back to
+        `redirect_uri` with a `code` and the original `state`.
+      operationId: oauthAuthorize
+      security: []
+      parameters:
+        - name: client_id
+          in: query
+          required: true
+          schema: { type: string }
+          description: OAuth app client ID.
+        - name: response_type
+          in: query
+          required: true
+          schema: { type: string, enum: [code] }
+          description: Must be `code`.
+        - name: redirect_uri
+          in: query
+          required: true
+          schema: { type: string, format: uri }
+          description: URL Projetly redirects back to after authorization.
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+          description: Opaque value echoed back to prevent CSRF.
+        - name: timestamp
+          in: query
+          required: true
+          schema: { type: string }
+          description: Unix time (seconds) used in the signature.
+        - name: signature
+          in: query
+          required: true
+          schema: { type: string }
+          description: >-
+            `HMAC-SHA256(key = CLIENT_SECRET, message = "<client_id>:<timestamp>")`,
+            hex-encoded.
+      responses:
+        '302':
+          description: Redirect to `redirect_uri` with `code` and `state` query params.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /oauth/token:
+    servers:
+      - url: https://instance.api.projetly.io/api
+        description: Production identity/OAuth host.
+    post:
+      tags: [Authentication]
+      summary: Exchange an authorization code for tokens
+      operationId: oauthToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [code, client_id, grant_type, redirect_uri]
+              properties:
+                code:
+                  type: string
+                  description: Authorization code from the authorize redirect.
+                client_id:
+                  type: string
+                grant_type:
+                  type: string
+                  enum: [authorization_code]
+                redirect_uri:
+                  type: string
+                  format: uri
+      responses:
+        '200':
+          description: Tokens issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth_refresh/:
+    servers:
+      - url: https://instance.api.projetly.io/api
+        description: Production identity/OAuth host.
+    post:
+      tags: [Authentication]
+      summary: Refresh an access token
+      description: |
+        Exchanges a refresh token for a new access token. Note the response
+        carries the new refresh token under `refresh` (not `refresh_token`).
+      operationId: authRefresh
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [token, grant_type]
+              properties:
+                token:
+                  type: string
+                  description: The current refresh token.
+                grant_type:
+                  type: string
+                  enum: [refresh_token]
+      responses:
+        '200':
+          description: New access token issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  access_token: { type: string }
+                  refresh:
+                    type: string
+                    description: The new refresh token (note the field name).
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------------------------------------------------------------------
+  # Connection
+  # ---------------------------------------------------------------------------
+  /zapier/test:
+    get:
+      tags: [Connection]
+      summary: Verify the integration is active
+      description: Returns the linked organisation name; used as the connection test/label.
+      operationId: zapierTest
+      responses:
+        '200':
+          description: Integration active.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, examples: [success] }
+                  organisation: { type: string, examples: ["Acme Inc"] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  # ---------------------------------------------------------------------------
+  # Companies
+  # ---------------------------------------------------------------------------
+  /zapier/company:
+    get:
+      tags: [Companies]
+      summary: List companies (or fetch dropdown options / field config)
+      description: |
+        Default: returns a paginated list of companies. Modes:
+        - `options=options` → returns metadata option sets (types, segments,
+          industries, revenue/employee ranges) instead of company records.
+        - `field_config=<truthy>` → returns the company field configuration.
+      operationId: listCompanies
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/Filter'
+        - $ref: '#/components/parameters/NextCursor'
+        - $ref: '#/components/parameters/Options'
+        - $ref: '#/components/parameters/FieldConfig'
+      responses:
+        '200':
+          description: Company list (or options / field-config payload).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/CompanyListResponse'
+                  - $ref: '#/components/schemas/OptionsResponse'
+                  - $ref: '#/components/schemas/FieldConfigResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Companies]
+      summary: Create a company
+      operationId: createCompany
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCompanyRequest' }
+      responses:
+        '200':
+          description: Company created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Company' }
+        '400':
+          description: Validation error or duplicate company.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /zapier/company/{company_id}:
+    put:
+      tags: [Companies]
+      summary: Update a company
+      operationId: updateCompany
+      parameters:
+        - $ref: '#/components/parameters/CompanyId'
+        - $ref: '#/components/parameters/FieldConfig'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCompanyRequest' }
+      responses:
+        '200':
+          description: Company updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Company' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  # ---------------------------------------------------------------------------
+  # Contacts
+  # ---------------------------------------------------------------------------
+  /zapier/contact:
+    get:
+      tags: [Contacts]
+      summary: List contacts, fetch one, or fetch options / field config
+      description: |
+        Default: paginated contact list. Modes:
+        - `contact_id=<id>` → returns a single contact object.
+        - `options=options` → returns contact metadata option sets.
+        - `field_config=<truthy>` → returns the contact field configuration.
+      operationId: listContacts
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/Filter'
+        - $ref: '#/components/parameters/NextCursor'
+        - name: contact_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: When set, returns the single matching contact.
+        - $ref: '#/components/parameters/Options'
+        - $ref: '#/components/parameters/FieldConfig'
+      responses:
+        '200':
+          description: Contact list, single contact, options, or field config.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ContactListResponse'
+                  - $ref: '#/components/schemas/Contact'
+                  - $ref: '#/components/schemas/OptionsResponse'
+                  - $ref: '#/components/schemas/FieldConfigResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Contacts]
+      summary: Create a contact
+      operationId: createContact
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateContactRequest' }
+      responses:
+        '200':
+          description: Contact created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Contact' }
+        '400':
+          description: Validation error or duplicate contact.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /zapier/contact/{contact_id}:
+    put:
+      tags: [Contacts]
+      summary: Update a contact
+      operationId: updateContact
+      parameters:
+        - $ref: '#/components/parameters/ContactId'
+        - $ref: '#/components/parameters/FieldConfig'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateContactRequest' }
+      responses:
+        '200':
+          description: Contact updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Contact' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  # ---------------------------------------------------------------------------
+  # Templates
+  # ---------------------------------------------------------------------------
+  /zapier/templates:
+    get:
+      tags: [Templates]
+      summary: List templates (pipelines, deal stages, project templates)
+      operationId: listTemplates
+      parameters:
+        - name: module
+          in: query
+          required: false
+          schema: { type: string, examples: [templates] }
+          description: Template module, e.g. `templates`.
+        - name: template_type
+          in: query
+          required: false
+          schema: { type: string, examples: [pipelines, deal_stages, project] }
+          description: Template category.
+        - name: sub_template_type
+          in: query
+          required: false
+          schema: { type: integer, examples: [4, 5, 6] }
+          description: Sub-type filter for the template category.
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/ItemsPerPage'
+      responses:
+        '200':
+          description: Paginated template list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TemplateListResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  # ---------------------------------------------------------------------------
+  # Projects & Deals
+  # ---------------------------------------------------------------------------
+  /zapier/project:
+    get:
+      tags: [Projects & Deals]
+      summary: List projects or deals
+      description: |
+        Returns a paginated list. Use `module`/`project_type` to select the set:
+        - Projects: `module=projects`, `project_type=project`.
+        - Deals: `module=deal_plan`, `project_type=deal`.
+      operationId: listProjects
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/ItemsPerPage'
+        - name: project_type
+          in: query
+          required: false
+          schema: { type: string, examples: [project, deal] }
+        - name: module
+          in: query
+          required: false
+          schema: { type: string, examples: [projects, deal_plan] }
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/Filter'
+        - $ref: '#/components/parameters/DueFilter'
+      responses:
+        '200':
+          description: Paginated project/deal list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectListResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Projects & Deals]
+      summary: Create a project or deal
+      operationId: createProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProjectRequest' }
+      responses:
+        '200':
+          description: Project/deal created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreateProjectResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500':
+          description: Creation failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /zapier/project/info/{project_id}:
+    get:
+      tags: [Projects & Deals]
+      summary: Get project info or its milestones/tasks
+      description: |
+        Default: returns the project's info (including `template_id` and
+        `stages`). When `task_filter=true`, returns the project's `milestones`,
+        each containing its `tasks` — used by task search and the task webhook.
+      operationId: getProjectInfo
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/Filter'
+        - $ref: '#/components/parameters/DueFilter'
+        - name: task_filter
+          in: query
+          required: false
+          schema: { type: boolean }
+          description: When `true`, returns milestones with their tasks instead of project info.
+      responses:
+        '200':
+          description: Project info, or milestones with tasks.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ProjectInfo'
+                  - $ref: '#/components/schemas/MilestonesResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  # ---------------------------------------------------------------------------
+  # Users
+  # ---------------------------------------------------------------------------
+  /zapier/users:
+    get:
+      tags: [Users]
+      summary: List organization users
+      operationId: listUsers
+      responses:
+        '200':
+          description: Array of users.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  # ---------------------------------------------------------------------------
+  # Tasks
+  # ---------------------------------------------------------------------------
+  /zapier/task:
+    get:
+      tags: [Tasks]
+      summary: Get a task, task options, or a project's assignable users
+      description: |
+        Exactly one mode is selected by query params:
+        - `task_id=<id>` → returns the task details.
+        - `options=options` (+ optional `template_id`) → returns task status
+          options for the template.
+        - `users=users` (+ optional `project_id`) → returns the users
+          assignable on the project.
+      operationId: getTask
+      parameters:
+        - name: task_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: options
+          in: query
+          required: false
+          schema: { type: string, examples: [options] }
+        - name: template_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Used with `options` to scope status options to a template.
+        - name: users
+          in: query
+          required: false
+          schema: { type: string, examples: [users] }
+        - name: project_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Used with `users` to scope to a project's members.
+      responses:
+        '200':
+          description: Task details, task options, or a user array (depending on mode).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Task'
+                  - $ref: '#/components/schemas/TaskOptionsResponse'
+                  - type: array
+                    items: { $ref: '#/components/schemas/User' }
+        '400':
+          description: No `task_id`, `users`, or `options` provided.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Tasks]
+      summary: Create a task
+      operationId: createTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTaskRequest' }
+      responses:
+        '200':
+          description: Task created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task: { $ref: '#/components/schemas/Task' }
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  # ---------------------------------------------------------------------------
+  # Webhooks (REST hooks)
+  # ---------------------------------------------------------------------------
+  /webhook/subscribe:
+    post:
+      tags: [Webhooks]
+      summary: Subscribe to event webhooks
+      description: |
+        Registers a target URL to receive events. `events` is a string
+        containing a list literal, e.g. `"['company_created']"`. For task
+        events, `project_id` scopes delivery to one project.
+      operationId: webhookSubscribe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookSubscribeRequest' }
+      responses:
+        '200':
+          description: Subscription created. Returns the subscription id.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, description: Subscription id used to unsubscribe. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /webhook/unsubscribe:
+    delete:
+      tags: [Webhooks]
+      summary: Unsubscribe from event webhooks
+      operationId: webhookUnsubscribe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subscriptionId]
+              properties:
+                subscriptionId:
+                  type: string
+                  description: The id returned from subscribe.
+      responses:
+        '200':
+          description: Subscription removed.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+# =============================================================================
+# Components
+# =============================================================================
+components:
+
+  securitySchemes:
+    oauth2:
+      type: oauth2
+      description: OAuth2 authorization-code flow used to obtain the bearer access token.
+      flows:
+        authorizationCode:
+          authorizationUrl: https://instance.api.projetly.io/api/oauth/authorize/
+          tokenUrl: https://instance.api.projetly.io/api/oauth/token/
+          refreshUrl: https://instance.api.projetly.io/api/auth_refresh/
+          scopes:
+            deal.read: Read deals
+            deal.write: Create/update deals
+            project.read: Read projects
+            project.write: Create/update projects
+            company.read: Read companies
+            company.write: Create/update companies
+            contact.read: Read contacts
+            contact.write: Create/update contacts
+            template.read: Read templates
+            template.write: Write templates
+            user.read: Read users
+            user.write: Write users
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 'OAuth2 access token sent as `Authorization: Bearer <token>`.'
+    oauthTimestamp:
+      type: apiKey
+      in: header
+      name: X-OAuth-Timestamp
+      description: Current Unix time (seconds) used as the signature message component.
+    oauthSignature:
+      type: apiKey
+      in: header
+      name: X-OAuth-Signature
+      description: >-
+        `HMAC-SHA256(key = CLIENT_SECRET, message = "<CLIENT_ID>:<X-OAuth-Timestamp>")`,
+        hex-encoded. Proves the request originates from the registered integration.
+    functionsKey:
+      type: apiKey
+      in: header
+      name: x-functions-key
+      description: Azure Functions host key authorizing access to the endpoint.
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, default: 20 }
+      description: Maximum number of records to return.
+    Sort:
+      name: sort
+      in: query
+      required: false
+      schema: { type: string, examples: ["-creation_time", "-last_update_time"] }
+      description: Sort field; prefix with `-` for descending.
+    Filter:
+      name: filter
+      in: query
+      required: false
+      schema: { type: string }
+      description: JSON-encoded filter condition array.
+    NextCursor:
+      name: next_cursor
+      in: query
+      required: false
+      schema: { type: string }
+      description: Cursor token from a previous list response for pagination.
+    Options:
+      name: options
+      in: query
+      required: false
+      schema: { type: string, examples: [options] }
+      description: When set to `options`, returns metadata option sets instead of records.
+    FieldConfig:
+      name: field_config
+      in: query
+      required: false
+      schema: { type: string }
+      description: When truthy, returns/updates the resource field configuration.
+    Page:
+      name: page
+      in: query
+      required: false
+      schema: { type: integer }
+      description: 1-indexed page number for offset pagination.
+    ItemsPerPage:
+      name: items_per_page
+      in: query
+      required: false
+      schema: { type: integer }
+      description: Records per page for offset pagination.
+    DueFilter:
+      name: due_filter
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [all, today, tomorrow, yesterday, current_week, next_week, last_week, current_month, next_month, last_month]
+      description: Relative due-date range filter.
+    CompanyId:
+      name: company_id
+      in: path
+      required: true
+      schema: { type: string }
+    ContactId:
+      name: contact_id
+      in: path
+      required: true
+      schema: { type: string }
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Bad request — invalid or missing data.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Unauthorized — invalid/missing credentials or signature.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Forbidden — the caller lacks permission for this resource.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Not found — the resource does not exist.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Conflict — the resource already exists.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: Too many requests — an API rate limit was hit.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServerError:
+      description: Internal server error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+
+    Error:
+      type: object
+      description: Standard error envelope.
+      properties:
+        status: { type: string, examples: [error] }
+        message: { type: string }
+        error: { type: string, description: Present on auth/signature errors. }
+
+    TokenResponse:
+      type: object
+      additionalProperties: true
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, examples: [Bearer] }
+        expires_in: { type: integer }
+
+    Address:
+      type: object
+      additionalProperties: true
+      properties:
+        country: { type: string }
+        state: { type: string }
+        city: { type: string }
+        address: { type: string }
+        zip_code: { type: string }
+
+    OwnerRef:
+      type: object
+      additionalProperties: true
+      description: Reference to a user (owner).
+      properties:
+        user_id: { type: string }
+        full_name: { type: string }
+        email: { type: string }
+
+    StatusRef:
+      type: object
+      additionalProperties: true
+      properties:
+        status_key: { type: string }
+        status_name: { type: string }
+
+    # ----- Company -----------------------------------------------------------
+    Company:
+      type: object
+      additionalProperties: true
+      properties:
+        id: { type: string }
+        company_id: { type: string }
+        display_id: { type: string }
+        company_name: { type: string }
+        domain: { type: string }
+        linkedin_url: { type: string }
+        twitter_url: { type: string }
+        hq_location: { $ref: '#/components/schemas/Address' }
+        industry: { type: string }
+        employee_range: { type: string }
+        estimated_arr: { type: string }
+        description: { type: string }
+        company_owner:
+          oneOf:
+            - { $ref: '#/components/schemas/OwnerRef' }
+            - { type: string }
+            - { type: 'null' }
+        company_type: { type: string }
+        lead_status: { type: string }
+        lead_status_pipeline_id: { type: string }
+        operating_regions:
+          type: array
+          items: { type: string }
+        customer_segment: { type: string }
+        icp_fit: { type: string }
+        connection_strength: { type: string }
+        connection_source: { type: string }
+        vendor_being_replaced: { type: string }
+        replacement_urgency: { type: string }
+        category: { type: string }
+        record_source: { type: string }
+        employees: { type: integer }
+        created_by: { type: string }
+        last_updated_by: { type: string }
+        creation_time: { type: string, format: date-time }
+        last_update_time: { type: string, format: date-time }
+
+    CompanyListResponse:
+      type: object
+      additionalProperties: true
+      properties:
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/Company' }
+        next_cursor:
+          type: [string, 'null']
+          description: Cursor for the next page, or null when exhausted.
+
+    CreateCompanyRequest:
+      type: object
+      required: [company_name]
+      additionalProperties: true
+      properties:
+        company_name: { type: string }
+        domain: { type: string }
+        linkedin_url: { type: string }
+        twitter_url: { type: string }
+        description: { type: string }
+        lead_status: { $ref: '#/components/schemas/StatusRef' }
+        lead_status_pipeline_id: { type: string }
+        parent_company: { type: string }
+        parent_company_id: { type: string }
+        operating_regions:
+          type: array
+          items: { type: string }
+        category: { type: string }
+        industry: { type: string }
+        company_owner:
+          type: string
+          description: User id of the owner.
+        customer_segment: { type: string }
+        icp_fit: { type: string }
+        company_type: { type: string }
+        connection_source: { type: string }
+        vendor_being_replaced: { type: string }
+        estimated_arr:
+          type: string
+          description: Range key resolved from a numeric ARR (e.g. "5_10m", "50m+").
+        employee_range:
+          type: string
+          description: Range key resolved from a numeric employee count (e.g. "51-200").
+        hq_location: { $ref: '#/components/schemas/Address' }
+        record_source: { type: string, examples: [integration] }
+        is_draft: { type: boolean }
+        custom_fields:
+          type: object
+          additionalProperties: true
+
+    # ----- Contact -----------------------------------------------------------
+    Contact:
+      type: object
+      additionalProperties: true
+      properties:
+        id: { type: string }
+        contact_id: { type: string }
+        display_id: { type: string }
+        full_name: { type: string }
+        first_name: { type: string }
+        last_name: { type: string }
+        primary_email: { type: string }
+        secondary_emails:
+          type: array
+          items: { type: string }
+        primary_phone: { type: string }
+        phone:
+          type: object
+          additionalProperties: true
+          properties:
+            primary: { type: string }
+        phones:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        company:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              company_id: { type: string }
+              company_name: { type: string }
+        company_ids:
+          type: array
+          items: { type: string }
+        contact_owner:
+          oneOf:
+            - { $ref: '#/components/schemas/OwnerRef' }
+            - { type: 'null' }
+        lead_source: { type: string }
+        lead_status: { type: string }
+        lead_status_pipeline_id: { type: string }
+        contact_stage: { type: string }
+        job_title: { type: string }
+        department: { type: string }
+        location: { $ref: '#/components/schemas/Address' }
+        timezone: { type: string }
+        language: { type: string }
+        person_category:
+          type: object
+          additionalProperties: true
+          properties:
+            key: { type: string }
+            name: { type: string }
+        preferred_communication_channel: { type: string }
+        seniority_level: { type: string }
+        influence_level: { type: number }
+        interest_level: { type: number }
+        buying_role: { type: string }
+        signoff_authority: { type: string }
+        do_not_contact: { type: string }
+        whatsapp_number: { type: string }
+        campaign: { type: string }
+        internal_notes: { type: string }
+        linkedin_url: { type: string }
+        twitter_url: { type: string }
+        created_by: { type: string }
+        creation_time: { type: string, format: date-time }
+        last_update_time: { type: string, format: date-time }
+
+    ContactListResponse:
+      type: object
+      additionalProperties: true
+      properties:
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/Contact' }
+        next_cursor:
+          type: [string, 'null']
+
+    CreateContactRequest:
+      type: object
+      required: [primary_email, first_name]
+      additionalProperties: true
+      properties:
+        primary_email: { type: string }
+        primary_phone: { type: string }
+        first_name: { type: string }
+        last_name: { type: string }
+        full_name: { type: string }
+        job_title: { type: string }
+        linkedin_url: { type: string }
+        twitter_url: { type: string }
+        whatsapp_number: { type: string }
+        secondary_emails:
+          type: array
+          items: { type: string }
+        phones:
+          type: array
+          items: { type: string }
+        phone:
+          type: object
+          properties:
+            primary: { type: string }
+        company_ids:
+          type: array
+          items: { type: string }
+        location: { $ref: '#/components/schemas/Address' }
+        department: { type: string }
+        lead_status: { type: string }
+        lead_status_pipeline_id: { type: string }
+        contact_owner:
+          type: string
+          description: User id of the owner.
+        language: { type: string }
+        campaign: { type: string }
+        internal_notes: { type: string }
+        buying_role: { type: string }
+        person_category: { type: string }
+        communication_channel: { type: string }
+        lead_source: { type: string, examples: [integration] }
+        is_draft: { type: boolean }
+        custom_fields:
+          type: object
+          additionalProperties: true
+
+    # ----- Project / Deal ----------------------------------------------------
+    ProjectOrDeal:
+      type: object
+      additionalProperties: true
+      properties:
+        project_id: { type: string }
+        project_name: { type: string }
+        description: { type: string }
+        start_date: { type: string, format: date-time }
+        due_date: { type: string, format: date-time }
+        project_score: { type: number }
+        tasks_count: { type: integer }
+        is_arr: { type: boolean }
+        revenue: { type: string }
+        show_forecasted_date: { type: boolean }
+        project_fee: { type: number }
+        project_owner: { $ref: '#/components/schemas/OwnerRef' }
+        account_name: { type: string }
+        status: { $ref: '#/components/schemas/StatusRef' }
+        template_id: { type: string }
+        region: { type: string }
+        project_customers:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              full_name: { type: string }
+              email: { type: string }
+              role: { type: string }
+        customer_project_owner:
+          type: object
+          additionalProperties: true
+          properties:
+            name: { type: string }
+            full_name: { type: string }
+            email: { type: string }
+        external_map:
+          type: object
+          additionalProperties: true
+          properties:
+            project_id: { type: string }
+            project_flag: { type: boolean }
+        project_type: { type: string }
+        visible_to_all: { type: boolean }
+        expected_deal_value: { type: number }
+
+    ProjectListResponse:
+      type: object
+      additionalProperties: true
+      properties:
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectOrDeal' }
+        next_cursor:
+          type: [string, 'null']
+
+    ProjectInfo:
+      type: object
+      additionalProperties: true
+      description: Single project info payload.
+      properties:
+        project_id: { type: string }
+        project_name: { type: string }
+        template_id: { type: string }
+        stages:
+          type: array
+          items: { $ref: '#/components/schemas/Milestone' }
+
+    Milestone:
+      type: object
+      additionalProperties: true
+      properties:
+        milestone_id: { type: string }
+        name: { type: string }
+        status: { $ref: '#/components/schemas/StatusRef' }
+        tasks:
+          type: array
+          items: { $ref: '#/components/schemas/Task' }
+
+    MilestonesResponse:
+      type: object
+      additionalProperties: true
+      description: Returned when `task_filter=true`.
+      properties:
+        milestones:
+          type: array
+          items: { $ref: '#/components/schemas/Milestone' }
+
+    CreateProjectRequest:
+      type: object
+      required: [project, account]
+      additionalProperties: true
+      properties:
+        account_id:
+          type: string
+          description: Empty string to create a new account.
+        project:
+          type: object
+          additionalProperties: true
+          properties:
+            project_name: { type: string }
+            start_date: { type: string }
+            due_date: { type: string }
+            project_type:
+              type: string
+              examples: [onboarding, service_delivery, sales_deal_room]
+            project_fee: { type: number }
+            show_forecasted_date: { type: boolean }
+            revenue: { type: number }
+            is_arr: { type: boolean }
+            project_template:
+              type: object
+              additionalProperties: true
+            project_owner: { $ref: '#/components/schemas/ProjectMember' }
+            customer_project_owner: { $ref: '#/components/schemas/CustomerRef' }
+        account:
+          type: object
+          additionalProperties: true
+          properties:
+            company_id: { type: string }
+            account_name: { type: string }
+            description: { type: string }
+            region: { type: string }
+            vertical: { type: string }
+            segment: { type: string }
+            website_url: { type: string }
+            account_owner: { $ref: '#/components/schemas/ProjectMember' }
+            customer: { $ref: '#/components/schemas/CustomerRef' }
+            invite_type: { type: string, examples: [invite_later] }
+
+    CreateProjectResponse:
+      type: object
+      additionalProperties: true
+      properties:
+        status: { type: string, examples: [success] }
+        project_id: { type: string }
+        account_id: { type: string }
+        name: { type: string }
+        message: { type: string }
+
+    ProjectMember:
+      type: object
+      additionalProperties: true
+      properties:
+        user_id: { type: [string, 'null'] }
+        full_name: { type: [string, 'null'] }
+        profile_image: { type: [string, 'null'] }
+        email: { type: [string, 'null'] }
+        role: { type: [string, 'null'] }
+        phone_number: { type: [string, 'null'] }
+        is_customer: { type: boolean }
+
+    CustomerRef:
+      type: object
+      additionalProperties: true
+      properties:
+        contact_id: { type: [string, 'null'] }
+        name: { type: [string, 'null'] }
+        full_name: { type: [string, 'null'] }
+        email: { type: [string, 'null'] }
+        team_id: { type: string }
+        is_contact: { type: boolean }
+
+    # ----- Task --------------------------------------------------------------
+    Task:
+      type: object
+      additionalProperties: true
+      properties:
+        item_id: { type: string }
+        display_id: { type: string }
+        title: { type: string }
+        description: { type: [string, 'null'] }
+        due_date: { type: string }
+        tags:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              tag_id: { type: string }
+              tag_name: { type: string }
+        checklist_items:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              item: { type: string }
+              is_checked: { type: boolean }
+        is_completed: { type: boolean }
+        status: { $ref: '#/components/schemas/StatusRef' }
+        is_private: { type: boolean }
+        is_starred: { type: boolean }
+        is_predefined: { type: boolean }
+        is_blocked: { type: boolean }
+        project_id: { type: string }
+        project_name: { type: string }
+        milestone_id: { type: string }
+        milestone:
+          type: object
+          additionalProperties: true
+          properties:
+            name: { type: string }
+            milestone_id: { type: string }
+        users:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              user_id: { type: string }
+              full_name: { type: string }
+              email: { type: string }
+              role: { type: string }
+              added_date: { type: string, format: date-time }
+        creation_time: { type: string, format: date-time }
+        last_update_time: { type: string, format: date-time }
+
+    CreateTaskRequest:
+      type: object
+      required: [title, project_id]
+      additionalProperties: true
+      properties:
+        title: { type: string }
+        description: { type: string }
+        project_id: { type: string }
+        milestone_id: { type: string }
+        due_date:
+          type: string
+          description: Date (YYYY-MM-DD).
+        status: { $ref: '#/components/schemas/StatusRef' }
+        item_type: { type: integer, examples: [1] }
+        item_type_key: { type: string, examples: [task] }
+        users:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectMember' }
+        checklist_items:
+          type: array
+          items:
+            type: object
+            properties:
+              item: { type: string }
+              is_checked: { type: boolean }
+        tags:
+          type: array
+          items:
+            type: object
+            properties:
+              tag_name: { type: string }
+              is_new: { type: boolean }
+
+    TaskOptionsResponse:
+      type: object
+      additionalProperties: true
+      description: Task option sets for a template (e.g. available statuses).
+      properties:
+        status:
+          type: array
+          items: { $ref: '#/components/schemas/StatusRef' }
+
+    # ----- User --------------------------------------------------------------
+    User:
+      type: object
+      additionalProperties: true
+      properties:
+        id: { type: string }
+        user_id: { type: string }
+        full_name: { type: string }
+        email: { type: string }
+        role: { type: string }
+        phone_number: { type: string }
+        is_customer: { type: boolean }
+        is_partner: { type: boolean }
+
+    # ----- Template ----------------------------------------------------------
+    Template:
+      type: object
+      additionalProperties: true
+      properties:
+        id: { type: string }
+        org_temp_id: { type: string }
+        template_name: { type: string }
+        milestone:
+          type: array
+          items: { $ref: '#/components/schemas/Milestone' }
+
+    TemplateListResponse:
+      type: object
+      additionalProperties: true
+      properties:
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/Template' }
+
+    # ----- Options / Field config (generic) ----------------------------------
+    OptionsResponse:
+      type: array
+      description: |
+        Single-element array carrying metadata option sets (the exact keys
+        depend on the resource, e.g. `company_types`, `company_revenues`,
+        `contact_person_categories`, `contact_buying_roles`).
+      items:
+        type: object
+        additionalProperties: true
+
+    FieldConfigResponse:
+      type: object
+      additionalProperties: true
+      description: Resource field configuration metadata.
+
+    # ----- Webhooks ----------------------------------------------------------
+    WebhookSubscribeRequest:
+      type: object
+      required: [target_url, events, app_name]
+      additionalProperties: true
+      properties:
+        target_url:
+          type: string
+          format: uri
+          description: URL events are delivered to.
+        events:
+          type: string
+          description: >-
+            List literal of event names, e.g. "['company_created']" or
+            "['task_created', 'task_updated']".
+          examples: ["['company_created']"]
+        app_name:
+          type: string
+          examples: [zapier]
+        project_id:
+          type: string
+          description: Required for task events; scopes delivery to one project.
