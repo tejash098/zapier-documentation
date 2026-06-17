@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Projetly Zapier Integration API — Reference</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E" />
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      Renders ./openapi.yaml with Redoc.
+
+      Because the spec is fetched over HTTP, this page must be SERVED, not
+      opened from the file system (file://) — browsers block the fetch otherwise.
+
+      Local preview (any one of these):
+        npx http-server . -p 8080      then open http://localhost:8080
+        python -m http.server 8080     then open http://localhost:8080
+
+      Deploy: upload index.html and openapi.yaml together to any static host
+      (GitHub Pages, Netlify, Vercel, S3, etc.). No build step required.
+    -->
+    <redoc
+      spec-url="./openapi.yaml"
+      hide-download-button="false"
+    ></redoc>
+    <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+  </body>
+</html>
